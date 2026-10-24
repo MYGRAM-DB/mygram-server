@@ -1,0 +1,60 @@
+name: MYGRAM DevPilot Autonomous Repair
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mygram-devpilot-autonomous-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out DevPilot engine
+        uses: actions/checkout@v4
+        with:
+          ref: devpilot/auto-engine
+          path: devpilot-engine
+          persist-credentials: false
+      - name: Check out MYGRAM app
+        if: ${{ secrets.MYGRAM_APP_TOKEN != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: MYGRAM-DB/mygram-app
+          ref: main
+          token: ${{ secrets.MYGRAM_APP_TOKEN }}
+          path: mygram-app
+      - name: Explain missing credentials
+        if: ${{ secrets.MYGRAM_APP_TOKEN == '' || secrets.OPENAI_API_KEY == '' }}
+        run: echo "Configure MYGRAM_APP_TOKEN and OPENAI_API_KEY in repository Actions secrets to enable autonomous repair."
+      - name: Set up Node.js
+        if: ${{ secrets.MYGRAM_APP_TOKEN != '' && secrets.OPENAI_API_KEY != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run baseline JavaScript checks
+        if: ${{ secrets.MYGRAM_APP_TOKEN != '' && secrets.OPENAI_API_KEY != '' }}
+        id: checks
+        continue-on-error: true
+        working-directory: mygram-app
+        run: |
+          set -e
+          while IFS= read -r -d '' file; do node --check "$file"; done < <(find . -type f -name '*.js' -not -path './.git/*' -not -path './node_modules/*' -print0)
+      - name: Ask DevPilot for a repair proposal
+        if: ${{ steps.checks.outcome == 'failure' }}
+        working-directory: devpilot-engine/devpilot
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TARGET_WORKDIR: ../mygram-app
+          DEVPILOT_FAILURE_LOG: ${{ github.workspace }}/check-output.txt
+        run: node src/agent.js
+      - name: Publish proposal as a branch and pull request
+        if: ${{ steps.checks.outcome == 'failure' && secrets.MYGRAM_APP_TOKEN != '' }}
+        run: echo "Proposal publication is deliberately gated until repository token permissions and validation are configured."

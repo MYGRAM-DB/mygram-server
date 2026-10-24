@@ -15,7 +15,7 @@ concurrency:
 jobs:
   repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check available configuration without exposing secrets
         id: config
@@ -35,7 +35,7 @@ jobs:
       - name: Check out DevPilot engine
         uses: actions/checkout@v4
         with:
-          ref: devpilot/auto-engine
+          ref: ${{ github.ref_name }}
           path: devpilot-engine
           persist-credentials: false
 
@@ -47,30 +47,45 @@ jobs:
           ref: main
           token: ${{ secrets.MYGRAM_APP_TOKEN }}
           path: mygram-app
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Set up Node.js
         if: ${{ steps.config.outputs.enabled == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
+          cache-dependency-path: mygram-app/package.json
 
-      - name: Run baseline JavaScript syntax checks
+      - name: Install app test dependencies
+        if: ${{ steps.config.outputs.enabled == 'true' }}
+        working-directory: mygram-app
+        run: npm install --no-audit --no-fund
+
+      - name: Install Playwright browser
+        if: ${{ steps.config.outputs.enabled == 'true' }}
+        working-directory: mygram-app
+        run: npx playwright install --with-deps chromium
+
+      - name: Run baseline syntax and end-to-end checks
         if: ${{ steps.config.outputs.enabled == 'true' }}
         id: baseline
         continue-on-error: true
         shell: bash
         working-directory: mygram-app
         run: |
-          set -o pipefail
+          set +e
           : > "$GITHUB_WORKSPACE/check-output.txt"
+          find . -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) -not -path './.git/*' -not -path './node_modules/*' -print0 |
           while IFS= read -r -d '' file; do
-            if ! node --check "$file" 2>&1; then
-              echo "Syntax check failed: $file" | tee -a "$GITHUB_WORKSPACE/check-output.txt"
-              node --check "$file" 2>&1 | tee -a "$GITHUB_WORKSPACE/check-output.txt" || true
-              exit 1
-            fi
-          done < <(find . -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) -not -path './.git/*' -not -path './node_modules/*' -print0)
+            node --check "$file" >> "$GITHUB_WORKSPACE/check-output.txt" 2>&1
+            rc=$?
+            if [[ $rc -ne 0 ]]; then echo "Syntax check failed: $file" >> "$GITHUB_WORKSPACE/check-output.txt"; exit $rc; fi
+          done
+          syntax_rc=$?
+          if [[ $syntax_rc -ne 0 ]]; then cat "$GITHUB_WORKSPACE/check-output.txt"; exit "$syntax_rc"; fi
+          npm run test:e2e 2>&1 | tee -a "$GITHUB_WORKSPACE/check-output.txt"
+          exit ${PIPESTATUS[0]}
 
       - name: Ask DevPilot for a repair proposal
         if: ${{ steps.config.outputs.enabled == 'true' && steps.baseline.outcome == 'failure' }}
@@ -83,17 +98,42 @@ jobs:
           DEVPILOT_FAILURE_LOG: ${{ github.workspace }}/check-output.txt
         run: node src/agent.js
 
-      - name: Re-run JavaScript syntax checks after proposed repair
+      - name: Verify repaired app
         if: ${{ steps.config.outputs.enabled == 'true' && steps.baseline.outcome == 'failure' && steps.repair.outcome == 'success' }}
         id: verify
         continue-on-error: true
         shell: bash
         working-directory: mygram-app
         run: |
-          set -o pipefail
-          while IFS= read -r -d '' file; do
-            node --check "$file"
-          done < <(find . -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) -not -path './.git/*' -not -path './node_modules/*' -print0)
+          set -euo pipefail
+          while IFS= read -r -d '' file; do node --check "$file"; done < <(find . -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) -not -path './.git/*' -not -path './node_modules/*' -print0)
+          npm run test:e2e
+          git diff --check
+
+      - name: Publish verified repair branch and pull request
+        if: ${{ steps.config.outputs.enabled == 'true' && steps.baseline.outcome == 'failure' && steps.repair.outcome == 'success' && steps.verify.outcome == 'success' }}
+        working-directory: mygram-app
+        env:
+          GH_TOKEN: ${{ secrets.MYGRAM_APP_TOKEN }}
+          GH_REPO: MYGRAM-DB/mygram-app
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No repair diff exists; skipping branch and PR creation."
+            exit 0
+          fi
+          branch="devpilot/repair-${RUN_ID}"
+          git config user.name "MYGRAM DevPilot"
+          git config user.email "devpilot-bot@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -u
+          git commit -m "fix: automated DevPilot repair"
+          git push origin "$branch"
+          gh pr create --repo "$GH_REPO" --base main --head "$branch" \
+            --title "DevPilot repair: run ${RUN_ID}" \
+            --body "Automated repair proposal created by MYGRAM DevPilot. JavaScript syntax checks, Playwright end-to-end tests, and git diff --check passed before publication. Review the diff and checks before merging. This PR does not deploy or change the database."
 
       - name: Write run summary
         if: always()
@@ -110,12 +150,11 @@ jobs:
             echo
             echo "- UTC time: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "- Repair secrets configured: ${CONFIGURED:-unknown}"
-            echo "- Baseline syntax checks: ${BASELINE:-not-run}"
+            echo "- Baseline checks: ${BASELINE:-not-run}"
             echo "- Repair agent step: ${REPAIR:-not-run}"
-            echo "- Post-repair syntax checks: ${VERIFY:-not-run}"
+            echo "- Post-repair checks: ${VERIFY:-not-run}"
             echo
-            echo "This workflow does not publish a branch or pull request and does not deploy."
-            echo "Only JavaScript syntax checks are currently configured; passing them is not a substitute for the full test suite."
+            echo "Publication is gated on post-repair checks. This workflow does not merge or deploy."
           } | tee "$GITHUB_WORKSPACE/devpilot-report/report.md"
           if [[ -f "$GITHUB_WORKSPACE/check-output.txt" ]]; then
             cp "$GITHUB_WORKSPACE/check-output.txt" "$GITHUB_WORKSPACE/devpilot-report/check-output.txt"

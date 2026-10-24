@@ -124,6 +124,9 @@ jobs:
           git switch -c "$branch"
           git add -u
           git commit -m "fix: automated DevPilot repair"
+          # Configure Git to use the token already supplied to gh via GH_TOKEN.
+          # Do not embed the token in the remote URL or print it to logs.
+          gh auth setup-git --hostname github.com
           git push origin "$branch"
           gh pr create --repo "$GH_REPO" --base main --head "$branch" \
             --title "DevPilot repair: run ${RUN_ID}" \

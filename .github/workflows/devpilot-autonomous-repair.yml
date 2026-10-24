@@ -2,7 +2,7 @@ name: MYGRAM DevPilot Autonomous Repair
 
 on:
   schedule:
-    - cron: "7,22,37,52 * * * *"
+    - cron: "7 7 * * *"
   workflow_dispatch:
   pull_request:
     branches: [main]

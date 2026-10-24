@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -17,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Check available configuration without exposing secrets
+      - name: Check repair configuration without exposing secrets
         id: config
         shell: bash
         env:
@@ -26,31 +28,28 @@ jobs:
         run: |
           if [[ -n "$MYGRAM_APP_TOKEN" && -n "$OPENAI_API_KEY" ]]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "Repair credentials are configured."
+            echo "Repair mode is enabled."
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Repair is in report-only mode because one or more required secrets are missing."
+            echo "Repair credentials are missing. Running free checks and reports only."
           fi
 
       - name: Check out DevPilot engine
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.head_ref || github.ref_name }}
           path: devpilot-engine
           persist-credentials: false
 
       - name: Check out MYGRAM app
-        if: ${{ steps.config.outputs.enabled == 'true' }}
         uses: actions/checkout@v4
         with:
           repository: MYGRAM-DB/mygram-app
           ref: main
-          token: ${{ secrets.MYGRAM_APP_TOKEN }}
           path: mygram-app
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Set up Node.js
-        if: ${{ steps.config.outputs.enabled == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -58,34 +57,29 @@ jobs:
           cache-dependency-path: mygram-app/package.json
 
       - name: Install app test dependencies
-        if: ${{ steps.config.outputs.enabled == 'true' }}
         working-directory: mygram-app
         run: npm install --no-audit --no-fund
 
       - name: Install Playwright browser
-        if: ${{ steps.config.outputs.enabled == 'true' }}
         working-directory: mygram-app
         run: npx playwright install --with-deps chromium
 
       - name: Run baseline syntax and end-to-end checks
-        if: ${{ steps.config.outputs.enabled == 'true' }}
         id: baseline
         continue-on-error: true
         shell: bash
         working-directory: mygram-app
         run: |
-          set +e
+          set -uo pipefail
           : > "$GITHUB_WORKSPACE/check-output.txt"
-          find . -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) -not -path './.git/*' -not -path './node_modules/*' -print0 |
           while IFS= read -r -d '' file; do
-            node --check "$file" >> "$GITHUB_WORKSPACE/check-output.txt" 2>&1
-            rc=$?
-            if [[ $rc -ne 0 ]]; then echo "Syntax check failed: $file" >> "$GITHUB_WORKSPACE/check-output.txt"; exit $rc; fi
-          done
-          syntax_rc=$?
-          if [[ $syntax_rc -ne 0 ]]; then cat "$GITHUB_WORKSPACE/check-output.txt"; exit "$syntax_rc"; fi
+            if ! node --check "$file" >> "$GITHUB_WORKSPACE/check-output.txt" 2>&1; then
+              echo "Syntax check failed: $file" >> "$GITHUB_WORKSPACE/check-output.txt"
+              cat "$GITHUB_WORKSPACE/check-output.txt"
+              exit 1
+            fi
+          done < <(find . -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) -not -path './.git/*' -not -path './node_modules/*' -print0)
           npm run test:e2e 2>&1 | tee -a "$GITHUB_WORKSPACE/check-output.txt"
-          exit ${PIPESTATUS[0]}
 
       - name: Ask DevPilot for a repair proposal
         if: ${{ steps.config.outputs.enabled == 'true' && steps.baseline.outcome == 'failure' }}
@@ -149,12 +143,12 @@ jobs:
             echo "# MYGRAM DevPilot run report"
             echo
             echo "- UTC time: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            echo "- Repair secrets configured: ${CONFIGURED:-unknown}"
+            echo "- Repair credentials configured: ${CONFIGURED:-unknown}"
             echo "- Baseline checks: ${BASELINE:-not-run}"
             echo "- Repair agent step: ${REPAIR:-not-run}"
             echo "- Post-repair checks: ${VERIFY:-not-run}"
             echo
-            echo "Publication is gated on post-repair checks. This workflow does not merge or deploy."
+            echo "This workflow does not merge or deploy. Database migrations and production changes are out of scope."
           } | tee "$GITHUB_WORKSPACE/devpilot-report/report.md"
           if [[ -f "$GITHUB_WORKSPACE/check-output.txt" ]]; then
             cp "$GITHUB_WORKSPACE/check-output.txt" "$GITHUB_WORKSPACE/devpilot-report/check-output.txt"

@@ -1,0 +1,52 @@
+name: MYGRAM DevPilot Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+  metadata: read
+
+concurrency:
+  group: mygram-devpilot-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    name: Read-only repository health report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out DevPilot source only
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run syntax checks and tests
+        working-directory: devpilot
+        run: |
+          npm run check
+          npm test
+      - name: Collect read-only GitHub status
+        working-directory: devpilot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_OWNER: MYGRAM-DB
+          GITHUB_REPO: mygram-server
+          GITHUB_BRANCH: devpilot/bootstrap
+          REPORT_DIR: reports
+        run: node src/monitor.js
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mygram-devpilot-report-${{ github.run_number }}
+          path: devpilot/reports/
+          if-no-files-found: warn
+          retention-days: 14

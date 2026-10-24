@@ -125,8 +125,6 @@ jobs:
           git switch -c "$branch"
           git add -u
           git commit -m "fix: automated DevPilot repair"
-          # Configure Git to use the token already supplied to gh via GH_TOKEN.
-          # Do not embed the token in the remote URL or print it to logs.
           gh auth setup-git --hostname github.com
           git push origin "$branch"
           gh pr create --repo "$GH_REPO" --base main --head "$branch" \
@@ -166,3 +164,10 @@ jobs:
           path: devpilot-report/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Mark baseline failures clearly
+        if: ${{ always() && steps.baseline.outcome == 'failure' && (steps.config.outputs.enabled != 'true' || steps.repair.outcome != 'success' || steps.verify.outcome != 'success') }}
+        shell: bash
+        run: |
+          echo "::error::MYGRAM baseline checks failed and no verified repair was produced. See the uploaded report artifact."
+          exit 1

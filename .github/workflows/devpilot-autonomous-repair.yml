@@ -25,13 +25,14 @@ jobs:
         env:
           MYGRAM_APP_TOKEN: ${{ secrets.MYGRAM_APP_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEVPILOT_AI_ENABLED: ${{ vars.DEVPILOT_AI_ENABLED }}
         run: |
-          if [[ -n "$MYGRAM_APP_TOKEN" && -n "$OPENAI_API_KEY" ]]; then
+          if [[ "$DEVPILOT_AI_ENABLED" == "true" && -n "$MYGRAM_APP_TOKEN" && -n "$OPENAI_API_KEY" ]]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "Repair mode is enabled."
+            echo "AI repair explicitly enabled; API usage may incur charges."
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Repair credentials are missing. Running free checks and reports only."
+            echo "AI repair disabled by default. Running free checks and reports only."
           fi
 
       - name: Check out DevPilot engine

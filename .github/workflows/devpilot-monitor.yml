@@ -35,7 +35,6 @@ jobs:
       - name: Collect read-only GitHub status
         working-directory: devpilot
         env:
-          GITHUB_TOKEN: ${{ github.token }}
           GITHUB_OWNER: MYGRAM-DB
           GITHUB_REPO: mygram-app
           GITHUB_BRANCH: fix/auth-guards-mobile-login

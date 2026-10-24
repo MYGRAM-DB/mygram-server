@@ -1,0 +1,173 @@
+name: MYGRAM DevPilot Autonomous Repair
+
+on:
+  schedule:
+    - cron: "7 7 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mygram-devpilot-autonomous-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check repair configuration without exposing secrets
+        id: config
+        shell: bash
+        env:
+          MYGRAM_APP_TOKEN: ${{ secrets.MYGRAM_APP_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEVPILOT_AI_ENABLED: ${{ vars.DEVPILOT_AI_ENABLED }}
+        run: |
+          if [[ "$DEVPILOT_AI_ENABLED" == "true" && -n "$MYGRAM_APP_TOKEN" && -n "$OPENAI_API_KEY" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "AI repair explicitly enabled; API usage may incur charges."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "AI repair disabled by default. Running free checks and reports only."
+          fi
+
+      - name: Check out DevPilot engine
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          path: devpilot-engine
+          persist-credentials: false
+
+      - name: Check out MYGRAM app
+        uses: actions/checkout@v4
+        with:
+          repository: MYGRAM-DB/mygram-app
+          ref: main
+          path: mygram-app
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: mygram-app/package.json
+
+      - name: Install app test dependencies
+        working-directory: mygram-app
+        run: npm install --no-audit --no-fund
+
+      - name: Install Playwright browser
+        working-directory: mygram-app
+        run: npx playwright install --with-deps chromium
+
+      - name: Run baseline syntax and end-to-end checks
+        id: baseline
+        continue-on-error: true
+        shell: bash
+        working-directory: mygram-app
+        run: |
+          set -uo pipefail
+          : > "$GITHUB_WORKSPACE/check-output.txt"
+          while IFS= read -r -d '' file; do
+            if ! node --check "$file" >> "$GITHUB_WORKSPACE/check-output.txt" 2>&1; then
+              echo "Syntax check failed: $file" >> "$GITHUB_WORKSPACE/check-output.txt"
+              cat "$GITHUB_WORKSPACE/check-output.txt"
+              exit 1
+            fi
+          done < <(find . -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) -not -path './.git/*' -not -path './node_modules/*' -print0)
+          npm run test:e2e 2>&1 | tee -a "$GITHUB_WORKSPACE/check-output.txt"
+
+      - name: Ask DevPilot for a repair proposal
+        if: ${{ steps.config.outputs.enabled == 'true' && steps.baseline.outcome == 'failure' }}
+        id: repair
+        continue-on-error: true
+        working-directory: devpilot-engine/devpilot
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TARGET_WORKDIR: ${{ github.workspace }}/mygram-app
+          DEVPILOT_FAILURE_LOG: ${{ github.workspace }}/check-output.txt
+        run: node src/agent.js
+
+      - name: Verify repaired app
+        if: ${{ steps.config.outputs.enabled == 'true' && steps.baseline.outcome == 'failure' && steps.repair.outcome == 'success' }}
+        id: verify
+        continue-on-error: true
+        shell: bash
+        working-directory: mygram-app
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do node --check "$file"; done < <(find . -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) -not -path './.git/*' -not -path './node_modules/*' -print0)
+          npm run test:e2e
+          git diff --check
+
+      - name: Publish verified repair branch and pull request
+        if: ${{ steps.config.outputs.enabled == 'true' && steps.baseline.outcome == 'failure' && steps.repair.outcome == 'success' && steps.verify.outcome == 'success' }}
+        working-directory: mygram-app
+        env:
+          GH_TOKEN: ${{ secrets.MYGRAM_APP_TOKEN }}
+          GH_REPO: MYGRAM-DB/mygram-app
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No repair diff exists; skipping branch and PR creation."
+            exit 0
+          fi
+          branch="devpilot/repair-${RUN_ID}"
+          git config user.name "MYGRAM DevPilot"
+          git config user.email "devpilot-bot@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -u
+          git commit -m "fix: automated DevPilot repair"
+          gh auth setup-git --hostname github.com
+          git push origin "$branch"
+          gh pr create --repo "$GH_REPO" --base main --head "$branch" \
+            --title "DevPilot repair: run ${RUN_ID}" \
+            --body "Automated repair proposal created by MYGRAM DevPilot. JavaScript syntax checks, Playwright end-to-end tests, and git diff --check passed before publication. Review the diff and checks before merging. This PR does not deploy or change the database."
+
+      - name: Write run summary
+        if: always()
+        shell: bash
+        env:
+          CONFIGURED: ${{ steps.config.outputs.enabled }}
+          BASELINE: ${{ steps.baseline.outcome }}
+          REPAIR: ${{ steps.repair.outcome }}
+          VERIFY: ${{ steps.verify.outcome }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/devpilot-report"
+          {
+            echo "# MYGRAM DevPilot run report"
+            echo
+            echo "- UTC time: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "- Repair credentials configured: ${CONFIGURED:-unknown}"
+            echo "- Baseline checks: ${BASELINE:-not-run}"
+            echo "- Repair agent step: ${REPAIR:-not-run}"
+            echo "- Post-repair checks: ${VERIFY:-not-run}"
+            echo
+            echo "This workflow does not merge or deploy. Database migrations and production changes are out of scope."
+          } | tee "$GITHUB_WORKSPACE/devpilot-report/report.md"
+          if [[ -f "$GITHUB_WORKSPACE/check-output.txt" ]]; then
+            cp "$GITHUB_WORKSPACE/check-output.txt" "$GITHUB_WORKSPACE/devpilot-report/check-output.txt"
+          fi
+
+      - name: Upload DevPilot report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mygram-devpilot-autonomous-report-${{ github.run_id }}
+          path: devpilot-report/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Mark baseline failures clearly
+        if: ${{ always() && steps.baseline.outcome == 'failure' && (steps.config.outputs.enabled != 'true' || steps.repair.outcome != 'success' || steps.verify.outcome != 'success') }}
+        shell: bash
+        run: |
+          echo "::error::MYGRAM baseline checks failed and no verified repair was produced. See the uploaded report artifact."
+          exit 1
